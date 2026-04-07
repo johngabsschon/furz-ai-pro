@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Furz AI Pro</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a1a;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100dvh;
+    padding: 30px 20px;
+    gap: 20px;
+  }
+  h1 { font-size: 1.8rem; letter-spacing: .05em; }
+  h1 span { font-size: 2rem; }
+
+  #btn {
+    width: 100px; height: 100px;
+    border-radius: 50%;
+    border: 3px solid #444;
+    background: #1a1a2e;
+    font-size: 2.5rem;
+    cursor: pointer;
+    transition: background .2s, transform .1s, box-shadow .2s;
+    box-shadow: 0 0 0 0 rgba(100,100,255,0);
+  }
+  #btn.recording {
+    background: #2a0a0a;
+    border-color: #ff4444;
+    box-shadow: 0 0 20px 8px rgba(255,50,50,.5);
+    animation: pulse 0.6s ease-in-out infinite alternate;
+  }
+  @keyframes pulse { to { transform: scale(1.08); } }
+
+  canvas {
+    width: 320px; height: 80px;
+    background: #111;
+    border-radius: 10px;
+    border: 1px solid #333;
+  }
+
+  #result {
+    font-size: 2rem;
+    font-weight: bold;
+    min-height: 3rem;
+    letter-spacing: .03em;
+  }
+
+  #confidence {
+    font-size: .85rem;
+    color: #888;
+    min-height: 1.2rem;
+  }
+
+  .bar-container {
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .bar-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: .85rem;
+  }
+  .bar-label { width: 120px; text-align: right; color: #aaa; }
+  .bar-track { flex: 1; background: #1a1a2e; border-radius: 4px; height: 10px; overflow: hidden; }
+  .bar-fill  { height: 100%; border-radius: 4px; background: #4466ff;
+               transition: width .3s ease; width: 0%; }
+
+  #status { font-size: .8rem; color: #555; }
+</style>
+</head>
+<body>
+
+<h1><span>💨</span> Furz AI PRO</h1>
+
+<canvas id="viz" width="320" height="80"></canvas>
+
+<button id="btn" title="Aufnehmen">🎤</button>
+
+<div id="result">Bereit…</div>
+<div id="confidence"></div>
+
+<div class="bar-container" id="bars"></div>
+
+<div id="status">Modell wird geladen…</div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const RECORD_MS   = 2000;
+const CLASSES     = ["silent","classic","machinegun","explosion","wet"];
+const LABELS      = {
+  0: "😶‍🌫️ Silent",
+  1: "💨 Classic",
+  2: "🔫 Machinegun",
+  3: "💥 Explosion",
+  4: "💀 Wet"
+};
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let model, vizAnalyser, vizAnim;
+
+// ── Build probability bars ────────────────────────────────────────────────────
+const barsEl = document.getElementById("bars");
+CLASSES.forEach((cls, i) => {
+  barsEl.innerHTML += `
+    <div class="bar-row">
+      <span class="bar-label">${LABELS[i]}</span>
+      <div class="bar-track"><div class="bar-fill" id="bar${i}"></div></div>
+    </div>`;
+});
+
+// ── Load model ────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    model = await tf.loadLayersModel("model/model.json");
+    document.getElementById("status").textContent = "✅ Modell geladen";
+    document.getElementById("btn").disabled = false;
+  } catch(e) {
+    document.getElementById("status").textContent = "❌ Fehler: " + e.message;
+  }
+})();
+
+// ── Visualizer ────────────────────────────────────────────────────────────────
+function startViz(stream) {
+  const ctx = new AudioContext();
+  vizAnalyser = ctx.createAnalyser();
+  vizAnalyser.fftSize = 256;
+  ctx.createMediaStreamSource(stream).connect(vizAnalyser);
+
+  const canvas = document.getElementById("viz");
+  const c = canvas.getContext("2d");
+  const data = new Uint8Array(vizAnalyser.frequencyBinCount);
+
+  function draw() {
+    vizAnim = requestAnimationFrame(draw);
+    vizAnalyser.getByteFrequencyData(data);
+    c.clearRect(0, 0, canvas.width, canvas.height);
+    const barW = (canvas.width / data.length) * 2.5;
+    let x = 0;
+    for (let i = 0; i < data.length; i++) {
+      const h = (data[i] / 255) * canvas.height;
+      const hue = 200 + (data[i] / 255) * 60;
+      c.fillStyle = `hsl(${hue},80%,50%)`;
+      c.fillRect(x, canvas.height - h, barW - 1, h);
+      x += barW;
+    }
+  }
+  draw();
+}
+
+// ── Feature Extraction ────────────────────────────────────────────────────────
+async function extractFeatures(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const actx = new AudioContext();
+  const audioBuffer = await actx.decodeAudioData(arrayBuffer);
+  const data = audioBuffer.getChannelData(0);
+
+  // 1. RMS
+  let sumSq = 0;
+  for (let i = 0; i < data.length; i++) sumSq += data[i] ** 2;
+  const rms = Math.sqrt(sumSq / data.length);
+
+  // 2. Zero Crossing Rate
+  let zc = 0;
+  for (let i = 1; i < data.length; i++)
+    if (data[i - 1] * data[i] < 0) zc++;
+  const zcr = zc / data.length;
+
+  // 3. Spectral Centroid via TF.js FFT
+  const N = 2048;
+  const chunk = data.slice(0, Math.min(N, data.length));
+  const padded = new Float32Array(N);
+  padded.set(chunk);
+  const tfChunk = tf.tensor1d(padded);
+  const fftResult = tf.spectral.rfft(tfChunk);
+  const mags = tf.abs(fftResult).dataSync();
+  let num = 0, den = 0;
+  for (let k = 0; k < mags.length; k++) {
+    num += k * mags[k];
+    den += mags[k];
+  }
+  const centroidNorm = den > 0 ? (num / den) / mags.length : 0;
+  tf.dispose([tfChunk, fftResult]);
+
+  // 4. Crest Factor (Peak / RMS) — normalised to [0,1] range
+  let peak = 0;
+  for (let i = 0; i < data.length; i++)
+    if (Math.abs(data[i]) > peak) peak = Math.abs(data[i]);
+  const crestNorm = Math.min((rms > 0 ? peak / rms : 0) / 20, 1.0);
+
+  return [rms * 10, zcr * 100, centroidNorm, crestNorm];
+}
+
+// ── Inference ─────────────────────────────────────────────────────────────────
+async function analyze(blob) {
+  try {
+    const features = await extractFeatures(blob);
+    const input = tf.tensor2d([features]);
+    const pred  = model.predict(input);
+    const probs = Array.from(pred.dataSync());
+    tf.dispose([input, pred]);
+
+    const idx = probs.indexOf(Math.max(...probs));
+
+    document.getElementById("result").textContent = LABELS[idx];
+    document.getElementById("confidence").textContent =
+      `Konfidenz: ${(probs[idx] * 100).toFixed(1)} %`;
+
+    probs.forEach((p, i) => {
+      document.getElementById(`bar${i}`).style.width = (p * 100).toFixed(1) + "%";
+    });
+
+    speechSynthesis.cancel();
+    speechSynthesis.speak(new SpeechSynthesisUtterance(LABELS[idx]));
+  } catch(e) {
+    document.getElementById("result").textContent = "⚠️ Fehler";
+    document.getElementById("status").textContent = e.message;
+  }
+}
+
+// ── Recording ─────────────────────────────────────────────────────────────────
+const btn = document.getElementById("btn");
+
+btn.addEventListener("click", async () => {
+  if (!model) return;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    startViz(stream);
+    btn.classList.add("recording");
+    btn.textContent = "⏹";
+    document.getElementById("result").textContent  = "⏺ Aufnahme…";
+    document.getElementById("confidence").textContent = "";
+
+    const rec = new MediaRecorder(stream);
+    const chunks = [];
+
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      cancelAnimationFrame(vizAnim);
+      btn.classList.remove("recording");
+      btn.textContent = "🎤";
+      document.getElementById("result").textContent = "🔬 Analyse…";
+      await analyze(new Blob(chunks));
+    };
+
+    rec.start();
+    setTimeout(() => rec.stop(), RECORD_MS);
+  } catch(e) {
+    document.getElementById("status").textContent = "Mikrofon: " + e.message;
+  }
+});
+
+// ── Service Worker ────────────────────────────────────────────────────────────
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.register("sw.js");
+</script>
+</body>
+</html>
